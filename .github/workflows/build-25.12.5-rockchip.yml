@@ -238,27 +238,32 @@ jobs:
             esac
           done
 
-          # The R28S carries an AIC8800D80. Check the staged install directory
-          # rather than just that an apk exists: this is the content that goes
-          # into it, and without the D80 blobs the driver loads and then fails
-          # to bring the chip up.
-          FWROOT=$(find build_dir -type d -path '*ipkg-*/aic8800-sdio-firmware/lib/firmware/aic8800/sdio' | head -1) || true
-          if [ -z "$FWROOT" ]; then
-            echo "::error::the staged firmware directory for aic8800-sdio-firmware was not found"
-            fail=1
-          else
-            n=$(find "$FWROOT" -iname '*d80*' | wc -l)
-            echo "--- firmware staged: $(find "$FWROOT" -type f | wc -l) files, $n of them D80"
-            [ "$n" -gt 0 ] || { echo "::error::no aic8800D80 firmware in the package"; fail=1; }
-          fi
-
+          # The R28S carries an AIC8800D80, and without its blobs the driver
+          # loads and then fails to bring the chip up. Read the package rather
+          # than the staged directory the last run looked at: OpenWrt deletes
+          # that as soon as it has made the apk, so it was reliably absent by
+          # the time this step ran.
           for p in kmod-aic8800-sdio aic8800-sdio-firmware; do
             a=$(find bin -name "$p-*.apk" | head -1) || true
             if [ -z "$a" ]; then
               echo "::error::$p apk was not produced"
               fail=1
-            else
-              echo "--- $a"
+              continue
+            fi
+            echo "--- $a"
+            if [ "$p" = aic8800-sdio-firmware ]; then
+              dump=$(staging_dir/host/bin/apk adbdump "$a" 2>/dev/null) || true
+              if [ -n "$dump" ]; then
+                n=$(printf '%s\n' "$dump" | grep -ci '8800d80') || true
+                echo "    ${n:-0} D80 firmware entries"
+                [ "${n:-0}" -gt 0 ] \
+                  || { echo "::error::the firmware package carries no aic8800D80 blobs"; fail=1; }
+              else
+                echo "::warning::could not read $a with apk; falling back to the source tree"
+                d=$(find build_dir -type d -path '*SDIO/driver_fw/fw/aic8800D80' | head -1) || true
+                [ -n "$d" ] \
+                  || { echo "::error::no aic8800D80 firmware directory in the vendor source either"; fail=1; }
+              fi
             fi
           done
           [ "$fail" = 0 ] || exit 1
