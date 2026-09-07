@@ -182,22 +182,38 @@ jobs:
       - name: Assert the kernel ABI matches the published 25.12.5 feed
         run: |
           cd "$SDK_DIR"
-          VM=$(find build_dir staging_dir -name '.vermagic' 2>/dev/null | head -1)
-          [ -n "$VM" ] || { echo "::error::no .vermagic found in the SDK"; exit 1; }
-          ACTUAL=$(cat "$VM")
+          # An SDK never builds a kernel, so it has no .vermagic file. The
+          # value is baked into include/kernel.mk when the SDK is packaged -
+          # target/sdk/Makefile substitutes it for the "unknown" fallback on
+          # the LINUX_VERMAGIC line - and that is what every kmod built here
+          # gets stamped with.
+          ACTUAL=$(grep 'LINUX_VERMAGIC' include/kernel.mk | grep -oE '[0-9a-f]{32}' | head -1) || true
+          [ -n "$ACTUAL" ] \
+            || { echo "::error::could not read LINUX_VERMAGIC out of the SDK's include/kernel.mk"; exit 1; }
           echo "SDK vermagic:      $ACTUAL"
           echo "expected vermagic: $EXPECTED_VERMAGIC"
           [ "$ACTUAL" = "$EXPECTED_VERMAGIC" ] \
             || { echo "::error::vermagic is $ACTUAL, expected $EXPECTED_VERMAGIC - the module would not load on a stock image"; exit 1; }
-          # ...and that the package really declares that dependency, which is
-          # what apk checks at install time.
+
           APK=$(find bin -name 'kmod-aic8800-sdio-*.apk' | head -1)
           [ -n "$APK" ] || { echo "::error::kmod-aic8800-sdio apk was not produced"; exit 1; }
           echo "package: $APK"
-          if strings "$APK" | grep -q "$EXPECTED_VERMAGIC"; then
-            echo "the apk references the expected vermagic"
+          # The above is what the SDK intends; this is what apk will actually
+          # check on the device, so read it back off the package rather than
+          # trusting the build to have used it.
+          DEP=$(staging_dir/host/bin/apk adbdump "$APK" 2>/dev/null \
+                | grep -oE "kernel=[0-9.]+~[0-9a-f]{32}-r[0-9]+" | head -1) || true
+          if [ -n "$DEP" ]; then
+            echo "declared dependency: $DEP"
+            case "$DEP" in
+              *"~$EXPECTED_VERMAGIC-"*)
+                echo "the package depends on the published kernel ABI" ;;
+              *)
+                echo "::error::the package declares $DEP, which is not ~$EXPECTED_VERMAGIC"
+                exit 1 ;;
+            esac
           else
-            echo "::warning::could not find the vermagic string in the apk (it is compressed); the .vermagic check above already gates this"
+            echo "::warning::could not read the package metadata with apk; the SDK vermagic check above already gates this"
           fi
 
       - name: Verify the built modules and firmware
@@ -205,22 +221,46 @@ jobs:
           cd "$SDK_DIR"
           fail=0
           for m in aic8800_bsp aic8800_fdrv; do
-            f=$(find build_dir -name "$m.ko" 2>/dev/null | head -1)
+            f=$(find build_dir -name "$m.ko" 2>/dev/null | head -1) || true
             if [ -z "$f" ]; then
-              echo "::error::$m.ko was not built"; fail=1
+              echo "::error::$m.ko was not built"
+              fail=1
+              continue
+            fi
+            # The kernel's own vermagic, which is not OpenWrt's hash but does
+            # say what this was compiled for. A module built against the wrong
+            # kernel would still produce a file and an apk.
+            vm=$(strings "$f" | grep -m1 '^vermagic=') || true
+            echo "--- $m.ko: ${vm:-(no vermagic string)}"
+            case "$vm" in
+              *6.12.94*aarch64*) ;;
+              *) echo "::error::$m.ko was not built for 6.12.94/aarch64"; fail=1 ;;
+            esac
+          done
+
+          # The R28S carries an AIC8800D80. Check the staged install directory
+          # rather than just that an apk exists: this is the content that goes
+          # into it, and without the D80 blobs the driver loads and then fails
+          # to bring the chip up.
+          FWROOT=$(find build_dir -type d -path '*ipkg-*/aic8800-sdio-firmware/lib/firmware/aic8800/sdio' | head -1) || true
+          if [ -z "$FWROOT" ]; then
+            echo "::error::the staged firmware directory for aic8800-sdio-firmware was not found"
+            fail=1
+          else
+            n=$(find "$FWROOT" -iname '*d80*' | wc -l)
+            echo "--- firmware staged: $(find "$FWROOT" -type f | wc -l) files, $n of them D80"
+            [ "$n" -gt 0 ] || { echo "::error::no aic8800D80 firmware in the package"; fail=1; }
+          fi
+
+          for p in kmod-aic8800-sdio aic8800-sdio-firmware; do
+            a=$(find bin -name "$p-*.apk" | head -1) || true
+            if [ -z "$a" ]; then
+              echo "::error::$p apk was not produced"
+              fail=1
             else
-              echo "--- $m.ko"
-              "$(find staging_dir/toolchain-* -name '*-objdump' | head -1)" -h "$f" >/dev/null 2>&1 \
-                && echo "    is a valid aarch64 object"
+              echo "--- $a"
             fi
           done
-          # The R28S carries an AIC8800D80; without its firmware the driver
-          # loads and then fails to bring the chip up.
-          FWDIR=$(find build_dir -type d -path '*SDIO/driver_fw/fw/aic8800D80' | head -1)
-          [ -n "$FWDIR" ] || { echo "::error::aic8800D80 firmware directory not found in the source"; fail=1; }
-          echo "--- firmware apk contents"
-          FWAPK=$(find bin -name 'aic8800-sdio-firmware-*.apk' | head -1)
-          [ -n "$FWAPK" ] || { echo "::error::aic8800-sdio-firmware apk was not produced"; fail=1; }
           [ "$fail" = 0 ] || exit 1
 
       - name: Collect artifacts
