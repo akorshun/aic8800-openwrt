@@ -55,6 +55,28 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Assert the patches survived checkout byte for byte
+        # Parts of the vendor source are CRLF, so four of these patches carry
+        # CRLF context lines and have to reach quilt exactly as they are.
+        # Anything that normalises line endings - a checkout on a machine with
+        # core.autocrlf, a well-meaning editor - turns them into
+        # "Hunk #1 FAILED (different line endings)" a good ten minutes into the
+        # run. .gitattributes marks the tree -text to prevent it; this proves
+        # it worked.
+        run: |
+          fail=0
+          for f in 020-wireless-6.16 030-update-firmware-path \
+                   050-log-level 080-fix-export-symbols-conflict; do
+            p="package/aic8800/patches/$f.patch"
+            if grep -qU $'\r' "$p"; then
+              echo "  $f.patch: CRLF intact"
+            else
+              echo "::error::$p lost its CRLF line endings - quilt will reject it"
+              fail=1
+            fi
+          done
+          [ "$fail" = 0 ] || exit 1
+
       - name: Install build dependencies
         run: |
           sudo apt-get update
