@@ -1,0 +1,255 @@
+name: Build aic8800 apk (25.12.5 rockchip/armv8)
+# Builds the AICSemi AIC8800 driver as standalone apk packages against the
+# official OpenWrt 25.12.5 SDK for rockchip/armv8, and publishes them as a
+# GitHub release.
+#
+# The point of using the official SDK rather than a tree of our own is the
+# kernel ABI: the SDK carries the same kernel config the released images were
+# built with, so the module comes out with the published vermagic and installs
+# on a stock 25.12.5 rockchip image - including the NanoPi R28S build, whose
+# kernel config is that same official one.
+#
+# Nothing here belongs in an OpenWrt tree. The driver is an out-of-tree vendor
+# blob-loader that upstream would not take, and keeping it separate means the
+# firmware images stay buildable from a clean OpenWrt checkout.
+
+on:
+  workflow_dispatch:
+    inputs:
+      verbose:
+        description: "Verbose make (V=s)"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+  push:
+    tags:
+      - 'aic8800-25.12.5-*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SDK_URL: https://downloads.openwrt.org/releases/25.12.5/targets/rockchip/armv8/openwrt-sdk-25.12.5-rockchip-armv8_gcc-14.3.0_musl.Linux-x86_64.tar.zst
+  SDK_SHA256: 59194a023968398af64bfa7d8bc3eac322641f6dc9cdbade28a4d9dd41866eba
+  SDK_DIR: openwrt-sdk-25.12.5-rockchip-armv8_gcc-14.3.0_musl.Linux-x86_64
+  # Published in targets/rockchip/armv8/kmods/ for 25.12.5. The SDK must
+  # arrive at this on its own; a mismatch means the module would refuse to
+  # load on a stock image, which is the whole point of this build.
+  EXPECTED_KERNEL: 6.12.94-1
+  EXPECTED_VERMAGIC: 5fab3a97d147fbf8146094eeebd78fd9
+
+jobs:
+  build:
+    name: aic8800 sdio apk (25.12.5 rockchip/armv8)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
+            gettext git libncurses-dev libssl-dev python3-setuptools python3-dev \
+            python3 rsync swig unzip zlib1g-dev file wget zstd ccache libelf-dev \
+            libdw-dev liblz4-dev libzstd-dev libxml-parser-perl
+
+      - name: Fetch and unpack the official SDK
+        run: |
+          curl -fsSL --retry 3 -o sdk.tar.zst "$SDK_URL"
+          echo "$SDK_SHA256  sdk.tar.zst" | sha256sum -c -
+          tar --zstd -xf sdk.tar.zst
+          [ -d "$SDK_DIR" ] || { echo "::error::unpacked SDK directory $SDK_DIR not found"; exit 1; }
+          rm -f sdk.tar.zst
+          echo "----- SDK feeds.conf.default -----"
+          cat "$SDK_DIR/feeds.conf.default"
+
+      - name: Add this repository as a feed
+        run: |
+          cd "$SDK_DIR"
+          # The SDK ships a generated 'base' feed pointing at the openwrt tree
+          # this SDK was cut from, which is where package/kernel/mac80211 comes
+          # from - the driver is built against its cfg80211 backport, not the
+          # in-kernel one, so without it nothing here resolves.
+          grep -q '^src-git --root=package base ' feeds.conf.default \
+            || { echo "::error::the SDK has no base feed - kmod-cfg80211 would be unresolvable"; exit 1; }
+          cp feeds.conf.default feeds.conf
+          echo "src-link aic8800 ${GITHUB_WORKSPACE}/package" >> feeds.conf
+          cat feeds.conf
+
+      - name: Update feeds
+        run: |
+          cd "$SDK_DIR"
+          # git.openwrt.org answers 504 now and then; a failed clone leaves a
+          # half-empty feed behind, so retry the update from scratch.
+          for i in 1 2 3 4; do
+            ./scripts/feeds update -a && break
+            echo "feeds update failed (attempt $i), retrying"
+            rm -rf feeds
+            sleep 30
+          done
+          ./scripts/feeds install -a
+
+      - name: Configure
+        run: |
+          cd "$SDK_DIR"
+          {
+            echo 'CONFIG_PACKAGE_kmod-aic8800-sdio=m'
+            echo 'CONFIG_PACKAGE_aic8800-sdio-firmware=y'
+            echo 'CONFIG_AIC8800_SDIO_BT_SUPPORT=y'
+            echo 'CONFIG_BUILD_LOG=y'
+          } > .config
+          make defconfig
+
+          fail=0
+          grep -qx 'CONFIG_PACKAGE_kmod-aic8800-sdio=m' .config \
+            || { echo "::error::kmod-aic8800-sdio is not selected after defconfig"; fail=1; }
+          grep -qE '^CONFIG_PACKAGE_aic8800-sdio-firmware=[ym]' .config \
+            || { echo "::error::aic8800-sdio-firmware is not selected after defconfig"; fail=1; }
+          # The driver includes the backport headers directly; if cfg80211 is
+          # not being built, those headers never land in staging_dir and the
+          # compile fails deep inside the vendor source with no useful message.
+          grep -qE '^CONFIG_PACKAGE_kmod-cfg80211=[ym]' .config \
+            || { echo "::error::kmod-cfg80211 did not get pulled in - is the base feed installed?"; fail=1; }
+          [ "$fail" = 0 ] || exit 1
+          echo "----- selected aic8800 / mac80211 options -----"
+          grep -E 'aic8800|cfg80211|mac80211=' .config || true
+
+      - name: Build
+        run: |
+          cd "$SDK_DIR"
+          make package/aic8800/compile -j$(nproc) \
+            ${{ inputs.verbose == 'true' && 'V=s' || 'V=s' }}
+
+      - name: Assert the kernel ABI matches the published 25.12.5 feed
+        run: |
+          cd "$SDK_DIR"
+          VM=$(find build_dir staging_dir -name '.vermagic' 2>/dev/null | head -1)
+          [ -n "$VM" ] || { echo "::error::no .vermagic found in the SDK"; exit 1; }
+          ACTUAL=$(cat "$VM")
+          echo "SDK vermagic:      $ACTUAL"
+          echo "expected vermagic: $EXPECTED_VERMAGIC"
+          [ "$ACTUAL" = "$EXPECTED_VERMAGIC" ] \
+            || { echo "::error::vermagic is $ACTUAL, expected $EXPECTED_VERMAGIC - the module would not load on a stock image"; exit 1; }
+          # ...and that the package really declares that dependency, which is
+          # what apk checks at install time.
+          APK=$(find bin -name 'kmod-aic8800-sdio-*.apk' | head -1)
+          [ -n "$APK" ] || { echo "::error::kmod-aic8800-sdio apk was not produced"; exit 1; }
+          echo "package: $APK"
+          if strings "$APK" | grep -q "$EXPECTED_VERMAGIC"; then
+            echo "the apk references the expected vermagic"
+          else
+            echo "::warning::could not find the vermagic string in the apk (it is compressed); the .vermagic check above already gates this"
+          fi
+
+      - name: Verify the built modules and firmware
+        run: |
+          cd "$SDK_DIR"
+          fail=0
+          for m in aic8800_bsp aic8800_fdrv; do
+            f=$(find build_dir -name "$m.ko" 2>/dev/null | head -1)
+            if [ -z "$f" ]; then
+              echo "::error::$m.ko was not built"; fail=1
+            else
+              echo "--- $m.ko"
+              "$(find staging_dir/toolchain-* -name '*-objdump' | head -1)" -h "$f" >/dev/null 2>&1 \
+                && echo "    is a valid aarch64 object"
+            fi
+          done
+          # The R28S carries an AIC8800D80; without its firmware the driver
+          # loads and then fails to bring the chip up.
+          FWDIR=$(find build_dir -type d -path '*SDIO/driver_fw/fw/aic8800D80' | head -1)
+          [ -n "$FWDIR" ] || { echo "::error::aic8800D80 firmware directory not found in the source"; fail=1; }
+          echo "--- firmware apk contents"
+          FWAPK=$(find bin -name 'aic8800-sdio-firmware-*.apk' | head -1)
+          [ -n "$FWAPK" ] || { echo "::error::aic8800-sdio-firmware apk was not produced"; fail=1; }
+          [ "$fail" = 0 ] || exit 1
+
+      - name: Collect artifacts
+        if: success()
+        run: |
+          mkdir -p artifacts
+          find "$SDK_DIR/bin" -name '*aic8800*.apk' -exec cp -v {} artifacts/ \;
+          cp -v "$SDK_DIR/.config" artifacts/build.config
+          ( cd artifacts && sha256sum *.apk > sha256sums )
+          ls -lh artifacts/
+          ls artifacts/ | grep -q 'kmod-aic8800-sdio' \
+            || { echo "::error::no kmod-aic8800-sdio apk in the artifacts"; exit 1; }
+          ls artifacts/ | grep -q 'aic8800-sdio-firmware' \
+            || { echo "::error::no aic8800-sdio-firmware apk in the artifacts"; exit 1; }
+
+      - name: Upload artifacts
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: aic8800-25.12.5-rockchip-armv8-${{ github.ref_name }}
+          path: artifacts/
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Create GitHub Release
+        if: success()
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('aic8800-25.12.5-build-{0}', github.run_number) }}
+          name: aic8800 for OpenWrt 25.12.5 rockchip/armv8 (${{ github.ref_name }})
+          files: artifacts/*
+          body: |
+            AICSemi **AIC8800** Wi-Fi driver built as standalone apk packages for
+            **OpenWrt 25.12.5, rockchip/armv8** (`aarch64_generic`).
+
+            Built with the official 25.12.5 SDK, so the modules carry the published
+            kernel ABI (`${{ env.EXPECTED_KERNEL }}-${{ env.EXPECTED_VERMAGIC }}`) and
+            install on a stock 25.12.5 rockchip image.
+
+            ### Install
+
+            Copy the two apk files to the device and:
+
+            ```
+            apk add --allow-untrusted ./aic8800-sdio-firmware-*.apk ./kmod-aic8800-sdio-*.apk
+            apk add wpad-basic-mbedtls        # if the image has no supplicant yet
+            reboot
+            ```
+
+            `wpad-*` comes from the official feed, which a stock image already has
+            configured.
+
+            ### What this is for
+
+            The SDIO packages drive the **AIC8800D80** module found on boards such as
+            the FriendlyElec NanoPi R28S (`SKI.WB800D80S.1`), which has no mainline
+            driver at all. The device tree on those builds already describes the SDIO
+            host, so the card is detected before this driver is installed - there is
+            simply nothing bound to it.
+
+            Bluetooth over SDIO is compiled in (`AIC8800_SDIO_BT_SUPPORT=y`); it needs
+            `kmod-bluetooth`, which apk pulls in.
+
+            ### Source
+
+            Driver: [radxa-pkg/aic8800](https://github.com/radxa-pkg/aic8800) pinned at
+            `89f865b8`. The OpenWrt packaging and patches are ImmortalWrt's
+            `package/kernel/aic8800`, unmodified - they were written against backports
+            6.18.39, which is exactly what OpenWrt 25.12 ships.
+
+      - name: Upload build logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs-${{ github.ref_name }}
+          path: |
+            ${{ env.SDK_DIR }}/logs/
+            ${{ env.SDK_DIR }}/.config
+          retention-days: 14
+          if-no-files-found: ignore
