@@ -52,11 +52,17 @@ publishes the apk files.
 
 * Driver: [radxa-pkg/aic8800](https://github.com/radxa-pkg/aic8800), pinned at
   `89f865b8`.
-* OpenWrt packaging (`package/aic8800/Makefile` and its `patches/`): taken
-  unmodified from ImmortalWrt's `package/kernel/aic8800`. Those patches were
-  written against backports **6.18.39**, which is exactly the version OpenWrt
-  25.12 ships — the cfg80211 API the driver compiles against is the same on
-  both sides, which is why they transplant cleanly.
+* OpenWrt packaging (`package/aic8800/Makefile` and its `patches/`): taken from
+  ImmortalWrt's `package/kernel/aic8800`. Those patches were written against
+  backports **6.18.39**, which is exactly the version OpenWrt 25.12 ships — the
+  cfg80211 API the driver compiles against is the same on both sides, which is
+  why they transplant cleanly, byte for byte.
+
+  The Makefile carries one addition: ImmortalWrt builds against a 6.18 kernel,
+  and 6.12 promotes `-Wmissing-prototypes` and `-Wexpansion-to-defined` to
+  errors, which the vendor source trips in ten places. `AIC_KCFLAGS` demotes
+  those two back to warnings. Nothing about types or implicit declarations is
+  touched — a warning that can hide a real defect stays fatal.
 
 Other prior art worth knowing about, none of it used directly here:
 [firtel-t/aic8800-sdio-openwrt](https://github.com/firtel-t/aic8800-sdio-openwrt)

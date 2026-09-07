@@ -3,8 +3,12 @@
 # Copyright (c) 2025 ImmortalWrt.org
 #
 # Taken from ImmortalWrt's package/kernel/aic8800 together with its patches
-# directory, unmodified. It is kept here rather than in an OpenWrt tree so the
-# driver can be built against the official SDK and shipped as a standalone apk.
+# directory. It is kept here rather than in an OpenWrt tree so the driver can
+# be built against the official SDK and shipped as a standalone apk.
+#
+# The only change from ImmortalWrt's copy is AIC_KCFLAGS below: they build
+# against a 6.18 kernel, and 6.12 turns two style warnings the vendor source
+# trips into errors. The patches are byte-identical.
 #
 # The pin below is what ImmortalWrt validated against backports 6.18.39, which
 # is also what OpenWrt 25.12 ships - so the cfg80211 API the driver is built
@@ -97,12 +101,30 @@ NOSTDINC_FLAGS:= \
 	-include backport/backport.h \
 	-DBUILD_OPENWRT
 
+# The 6.12 kernel this is built against raises -Wmissing-prototypes and
+# -Wexpansion-to-defined to errors, and the vendor source trips both: eight
+# non-static definitions with no prototype, and two `defined()` inside a macro
+# expansion. Neither can change what the code does, so demote them rather than
+# patch generated-looking vendor files.
+#
+# Only warnings of that kind are demoted. Anything about types, implicit
+# declarations or pointer conversions stays fatal - those are the ones that
+# would build a module and have it misbehave on the board.
+#
+# KCFLAGS and not EXTRA_CFLAGS: the kernel appends KCFLAGS to KBUILD_CFLAGS
+# last, so it also wins over the ccflags-y the driver's own Makefiles set.
+AIC_KCFLAGS := \
+	-Wno-error=missing-prototypes \
+	-Wno-error=missing-declarations \
+	-Wno-error=expansion-to-defined
+
 define Build/Compile
 
 ifneq ($(CONFIG_PACKAGE_kmod-aic8800-btusb),)
 	+$(KERNEL_MAKE) $(PKG_JOBS) \
 		M="$(PKG_BUILD_DIR)/src/USB/driver_fw/drivers/aic_btusb" \
 		NOSTDINC_FLAGS="$(NOSTDINC_FLAGS)" \
+		KCFLAGS="$(AIC_KCFLAGS)" \
 		CONFIG_AIC_FW_PATH="/lib/firmware/aic8800/usb" \
 		modules
 endif
@@ -110,6 +132,7 @@ ifneq ($(CONFIG_PACKAGE_kmod-aic8800-sdio),)
 	+$(KERNEL_MAKE) $(PKG_JOBS) \
 		M="$(PKG_BUILD_DIR)/src/SDIO/driver_fw/driver/aic8800" \
 		NOSTDINC_FLAGS="$(NOSTDINC_FLAGS)" \
+		KCFLAGS="$(AIC_KCFLAGS)" \
 		CONFIG_AIC_FW_PATH="/lib/firmware/aic8800/sdio" \
 		CONFIG_AIC8800_BTLPM_SUPPORT=n \
 		CONFIG_SDIO_BT=$(if $(CONFIG_AIC8800_SDIO_BT_SUPPORT),y,n) \
@@ -119,6 +142,7 @@ ifneq ($(CONFIG_PACKAGE_kmod-aic8800-pcie),)
 	+$(KERNEL_MAKE) $(PKG_JOBS) \
 		M="$(PKG_BUILD_DIR)/src/PCIE/driver_fw/driver/aic8800/aic8800_fdrv" \
 		NOSTDINC_FLAGS="$(NOSTDINC_FLAGS)" \
+		KCFLAGS="$(AIC_KCFLAGS)" \
 		CONFIG_AIC_FW_PATH="/lib/firmware/aic8800/pcie" \
 		modules
 endif
@@ -126,6 +150,7 @@ ifneq ($(CONFIG_PACKAGE_kmod-aic8800-usb),)
 	+$(KERNEL_MAKE) $(PKG_JOBS) \
 		M="$(PKG_BUILD_DIR)/src/USB/driver_fw/drivers/aic8800" \
 		NOSTDINC_FLAGS="$(NOSTDINC_FLAGS)" \
+		KCFLAGS="$(AIC_KCFLAGS)" \
 		CONFIG_AIC_FW_PATH="/lib/firmware/aic8800/usb" \
 		modules
 endif
