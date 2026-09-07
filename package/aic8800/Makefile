@@ -101,22 +101,27 @@ NOSTDINC_FLAGS:= \
 	-include backport/backport.h \
 	-DBUILD_OPENWRT
 
-# The 6.12 kernel this is built against raises -Wmissing-prototypes and
-# -Wexpansion-to-defined to errors, and the vendor source trips both: eight
-# non-static definitions with no prototype, and two `defined()` inside a macro
-# expansion. Neither can change what the code does, so demote them rather than
-# patch generated-looking vendor files.
+# The 6.12 kernel this is built against turns several style warnings into
+# errors that the vendor source trips: definitions with no prototype,
+# defined() inside a macro expansion, unused statics. None of them can change
+# what the code does, so demote them rather than edit vendor files.
 #
-# Only warnings of that kind are demoted. Anything about types, implicit
-# declarations or pointer conversions stays fatal - those are the ones that
-# would build a module and have it misbehave on the board.
+# Only warnings of that kind are demoted. Types, implicit declarations,
+# pointer conversions and -Wattribute-warning stay fatal - the last one is
+# how FORTIFY_SOURCE reports a provable out-of-bounds write, and one of those
+# is worth a failed build. The single fortify hit this driver does produce is
+# a false positive and is dealt with in 090-, at that one call site, so a
+# genuine one anywhere else still stops the build.
 #
 # KCFLAGS and not EXTRA_CFLAGS: the kernel appends KCFLAGS to KBUILD_CFLAGS
 # last, so it also wins over the ccflags-y the driver's own Makefiles set.
 AIC_KCFLAGS := \
 	-Wno-error=missing-prototypes \
 	-Wno-error=missing-declarations \
-	-Wno-error=expansion-to-defined
+	-Wno-error=expansion-to-defined \
+	-Wno-error=unused-function \
+	-Wno-error=unused-variable \
+	-Wno-error=unused-but-set-variable
 
 define Build/Compile
 
